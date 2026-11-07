@@ -1,36 +1,68 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# twitter-save-photos
 
-## Getting Started
+A free web app that downloads **all photos and videos** from any X (Twitter)
+profile and packages them into a ZIP file with `photos/` and `videos/` folders.
 
-First, run the development server:
+No paid API keys required — it uses X's own web endpoints.
+
+## Features
+
+- Enter a username → scans their timeline (paginated)
+- Separates media into `photos/` and `videos/` inside the ZIP
+- Videos are downloaded at the highest available MP4 quality
+- Fully client-side ZIP packaging via [JSZip](https://stuk.github.io/jszip/)
+
+## Run locally
 
 ```bash
+npm install
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open http://localhost:3000
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Environment variables (optional)
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+Everything works **without** any env vars. However, X rate-limits anonymous
+requests, so for heavy use you can add your own logged-in session cookies to
+`.env.local` (see `.env.example`):
 
-## Learn More
+```bash
+cp .env.example .env.local
+```
 
-To learn more about Next.js, take a look at the following resources:
+Then fill in:
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+- `AUTH_TOKEN` — value of the `auth_token` cookie from x.com
+- `CT0` — value of the `ct0` cookie from x.com
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+To get them: log in to x.com → DevTools (F12) → Application → Cookies →
+`https://x.com` → copy the two values. **Never commit `.env.local`** — it's
+gitignored. Treat these like passwords.
 
-## Deploy on Vercel
+## Deploy to Vercel (free)
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+1. Push this repo to GitHub.
+2. Go to [vercel.com/new](https://vercel.com/new), import the repo.
+3. Framework preset: **Next.js** — no env vars needed, just Deploy.
+4. Optionally add `AUTH_TOKEN`/`CT0` under Project → Settings → Environment
+   Variables if you hit rate limits.
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+Hobby tier is free and sufficient for personal use.
+
+## How it works
+
+- `app/api/media` — server-side route that calls X's GraphQL endpoints
+  (`UserByScreenName` + `UserTweets`) with a guest token and extracts media
+  URLs from tweets.
+- `app/api/proxy` — streams media bytes from `pbs.twimg.com` /
+  `video.twimg.com` (avoids CORS and hotlink issues).
+- `app/page.tsx` — UI + ZIP generation entirely in the browser.
+
+## Notes & limitations
+
+- This uses unofficial endpoints; X can change or rate-limit them at any time.
+- Very large profiles take a while — use the "Max pages" setting to limit
+  how much history is scanned (each page ≈ 40 tweets).
+- Scraping may violate X's Terms of Service — use responsibly, only for
+  content you have the right to download.
