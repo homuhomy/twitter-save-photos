@@ -147,6 +147,21 @@ function extOf(url: string, fallback: string): string {
   return e === "jpeg" ? "jpg" : e;
 }
 
+export interface ScrapeOptions {
+  maxPages?: number;
+  cursor?: string;
+  from?: Date; // oldest date to include
+  to?: Date; // newest date to include
+  maxMedia?: number; // stop after this many items
+}
+
+function tweetDate(legacy: any): Date | null {
+  const s: string | undefined = legacy?.created_at;
+  if (!s) return null;
+  const d = new Date(s);
+  return isNaN(d.getTime()) ? null : d;
+}
+
 /**
  * Scrapes up to `maxPages` timeline pages starting at `cursor`.
  * Never throws mid-loop: on error it returns partial results plus nextCursor
@@ -154,9 +169,10 @@ function extOf(url: string, fallback: string): string {
  */
 export async function scrapeUserMedia(
   rawUsername: string,
-  maxPages = 5,
-  cursor?: string
+  opts: ScrapeOptions = {}
 ): Promise<ScrapeResult> {
+  const { maxPages = 5, from, to, maxMedia } = opts;
+  let cursor = opts.cursor;
   const screenName = rawUsername.replace(/^@/, "").trim();
   if (!screenName) throw new Error("Username is required");
 
@@ -190,6 +206,7 @@ export async function scrapeUserMedia(
 
     let nextCursor: string | undefined;
     let tweetsThisPage = 0;
+    let oldest: Date | null = null;
     for (const ins of instructions) {
       for (const entry of ins.entries ?? []) {
         const entryId: string = entry.entryId ?? "";
@@ -203,8 +220,13 @@ export async function scrapeUserMedia(
         }
         const tweet = unwrapTweet(entry);
         if (!tweet?.rest_id) continue;
-        tweetsThisPage++;
         const legacy = tweet.legacy;
+        const ts = tweetDate(legacy);
+        if (ts && (oldest == null || ts < oldest)) oldest = ts;
+        // Date filter: skip tweets outside the range.
+        if (to && ts && ts > to) continue;
+        if (from && ts && ts < from) continue;
+        tweetsThisPage++;
         // Skip retweets — only media owned by this user.
         if (legacy.retweeted_status_result) continue;
         const media =
@@ -238,6 +260,15 @@ export async function scrapeUserMedia(
     pagesFetched++;
     tweetsScanned += tweetsThisPage;
     cursor = nextCursor;
+    // Stop early: hit max media, ran out of pages, or timeline went
+    // older than the "from" bound (timeline is reverse-chronological).
+    if (maxMedia && items.length >= maxMedia) {
+      items.length = maxMedia;
+      cursor = undefined;
+      done = true;
+    }
+    // Guard against pinned old tweets on page 1 stopping the scan early.
+    if (from && oldest && oldest < from && pagesFetched > 1) done = true;
     if (!cursor) done = true;
   }
 

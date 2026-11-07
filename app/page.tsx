@@ -26,6 +26,9 @@ const MAX_TOTAL_PAGES = 100; // ~4000 tweets; raise if needed
 
 export default function Home() {
   const [username, setUsername] = useState("");
+  const [fromDate, setFromDate] = useState("");
+  const [toDate, setToDate] = useState("");
+  const [maxMedia, setMaxMedia] = useState("");
   const [scanning, setScanning] = useState(false);
   const [downloading, setDownloading] = useState(false);
   const [progress, setProgress] = useState({ done: 0, total: 0 });
@@ -42,6 +45,9 @@ export default function Home() {
       pages: String(PAGES_PER_REQUEST),
     });
     if (startCursor) params.set("cursor", startCursor);
+    if (fromDate) params.set("from", fromDate);
+    if (toDate) params.set("to", toDate);
+    if (maxMedia) params.set("maxMedia", maxMedia);
     const res = await fetch(`/api/media?${params}`);
     const data = (await res.json()) as ScrapeResult & { error?: string };
     if (!res.ok) throw new Error(data.error ?? `Request failed (${res.status})`);
@@ -182,6 +188,38 @@ export default function Home() {
               : `Download ZIP (${items.length})`}
           </button>
         )}
+      </div>
+
+      <div className="mt-3 flex flex-wrap items-end gap-3">
+        <label>
+          <span className="text-xs text-neutral-500">From (oldest)</span>
+          <input
+            type="date"
+            value={fromDate}
+            onChange={(e) => setFromDate(e.target.value)}
+            className="mt-1 block rounded-lg border border-neutral-700 bg-neutral-900 px-3 py-1.5 text-sm outline-none focus:border-neutral-400"
+          />
+        </label>
+        <label>
+          <span className="text-xs text-neutral-500">To (newest)</span>
+          <input
+            type="date"
+            value={toDate}
+            onChange={(e) => setToDate(e.target.value)}
+            className="mt-1 block rounded-lg border border-neutral-700 bg-neutral-900 px-3 py-1.5 text-sm outline-none focus:border-neutral-400"
+          />
+        </label>
+        <label>
+          <span className="text-xs text-neutral-500">Max media (blank = all)</span>
+          <input
+            type="number"
+            min={1}
+            value={maxMedia}
+            onChange={(e) => setMaxMedia(e.target.value)}
+            placeholder="e.g. 100"
+            className="mt-1 block w-36 rounded-lg border border-neutral-700 bg-neutral-900 px-3 py-1.5 text-sm outline-none focus:border-neutral-400"
+          />
+        </label>
       </div>
 
       {stats.pages > 0 && (
