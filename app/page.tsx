@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import JSZip from "jszip";
 
 interface MediaItem {
@@ -15,51 +15,96 @@ interface ScrapeResult {
   user: { name: string; screenName: string; avatar?: string };
   items: MediaItem[];
   pagesFetched: number;
+  tweetsScanned: number;
+  nextCursor: string | null;
   done: boolean;
+  error?: string;
 }
+
+const PAGES_PER_REQUEST = 5;
+const MAX_TOTAL_PAGES = 100; // ~4000 tweets; raise if needed
 
 export default function Home() {
   const [username, setUsername] = useState("");
-  const [pages, setPages] = useState(25);
-  const [loading, setLoading] = useState(false);
+  const [scanning, setScanning] = useState(false);
   const [downloading, setDownloading] = useState(false);
   const [progress, setProgress] = useState({ done: 0, total: 0 });
-  const [result, setResult] = useState<ScrapeResult | null>(null);
+  const [stats, setStats] = useState({ pages: 0, tweets: 0 });
+  const [items, setItems] = useState<MediaItem[]>([]);
+  const [user, setUser] = useState<ScrapeResult["user"] | null>(null);
+  const [cursor, setCursor] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const seen = useRef(new Set<string>());
 
-  async function search() {
+  async function fetchBatch(startCursor: string | null) {
+    const params = new URLSearchParams({
+      username: username.trim(),
+      pages: String(PAGES_PER_REQUEST),
+    });
+    if (startCursor) params.set("cursor", startCursor);
+    const res = await fetch(`/api/media?${params}`);
+    const data = (await res.json()) as ScrapeResult & { error?: string };
+    if (!res.ok) throw new Error(data.error ?? `Request failed (${res.status})`);
+    return data;
+  }
+
+  async function scan(first: boolean) {
     if (!username.trim()) return;
-    setLoading(true);
+    setScanning(true);
     setError(null);
-    setResult(null);
+
+    let cur = first ? null : cursor;
+    let pages = first ? 0 : stats.pages;
+    let tweets = first ? 0 : stats.tweets;
+    if (first) {
+      setItems([]);
+      setUser(null);
+      seen.current = new Set();
+    }
+
     try {
-      const res = await fetch(
-        `/api/media?username=${encodeURIComponent(username.trim())}&pages=${pages}`
-      );
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error ?? `Request failed (${res.status})`);
-      setResult(data);
+      while (pages < MAX_TOTAL_PAGES) {
+        const data = await fetchBatch(cur);
+        setUser(data.user);
+        const fresh = data.items.filter((i) => !seen.current.has(i.url));
+        fresh.forEach((i) => seen.current.add(i.url));
+        if (fresh.length) setItems((prev) => [...prev, ...fresh]);
+
+        pages += data.pagesFetched;
+        tweets += data.tweetsScanned;
+        setStats({ pages, tweets });
+        cur = data.nextCursor;
+        setCursor(cur);
+
+        if (data.error) {
+          setError(data.error + " — progress saved, hit Resume to continue.");
+          return;
+        }
+        if (data.done) return;
+      }
+      setError("Reached max page limit — use Resume to keep going.");
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Something went wrong");
+      setError(
+        (e instanceof Error ? e.message : "Something went wrong") +
+          " — progress saved, hit Resume to continue."
+      );
     } finally {
-      setLoading(false);
+      setScanning(false);
     }
   }
 
   async function downloadAll() {
-    if (!result) return;
     setDownloading(true);
     setError(null);
-    setProgress({ done: 0, total: result.items.length });
+    setProgress({ done: 0, total: items.length });
 
     const zip = new JSZip();
     const photos = zip.folder("photos")!;
     const videos = zip.folder("videos")!;
-    const folderFor = (t: string) => (t === "video" ? videos : photos);
 
     let done = 0;
     let failed = 0;
-    const queue = [...result.items];
+    const queue = [...items];
     const workers = Array.from({ length: 6 }, async () => {
       while (queue.length) {
         const item = queue.shift()!;
@@ -67,31 +112,28 @@ export default function Home() {
           const res = await fetch(`/api/proxy?url=${encodeURIComponent(item.url)}`);
           if (!res.ok) throw new Error(`HTTP ${res.status}`);
           const blob = await res.blob();
-          folderFor(item.type).file(item.filename, blob);
+          (item.type === "video" ? videos : photos).file(item.filename, blob);
         } catch {
           failed++;
         }
         done++;
-        setProgress({ done, total: result.items.length });
+        setProgress({ done, total: items.length });
       }
     });
     await Promise.all(workers);
-
-    if (failed > 0) {
-      setError(`${failed} file(s) failed to download and were skipped.`);
-    }
+    if (failed > 0) setError(`${failed} file(s) failed to download and were skipped.`);
 
     const blob = await zip.generateAsync({ type: "blob" });
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
-    a.download = `twitter-${result.user.screenName}-media.zip`;
+    a.download = `twitter-${user?.screenName ?? "user"}-media.zip`;
     a.click();
     URL.revokeObjectURL(a.href);
     setDownloading(false);
   }
 
-  const photos = result?.items.filter((i) => i.type === "photo").length ?? 0;
-  const vids = result?.items.filter((i) => i.type === "video").length ?? 0;
+  const photos = items.filter((i) => i.type === "photo").length;
+  const vids = items.filter((i) => i.type === "video").length;
 
   return (
     <main className="mx-auto max-w-4xl px-4 py-12">
@@ -107,41 +149,47 @@ export default function Home() {
           <input
             value={username}
             onChange={(e) => setUsername(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && search()}
+            onKeyDown={(e) => e.key === "Enter" && scan(true)}
             placeholder="@username"
             className="mt-1 w-full rounded-lg border border-neutral-700 bg-neutral-900 px-3 py-2 outline-none focus:border-neutral-400"
           />
         </label>
-        <label>
-          <span className="text-sm text-neutral-400">Max pages</span>
-          <input
-            type="number"
-            min={1}
-            max={100}
-            value={pages}
-            onChange={(e) => setPages(parseInt(e.target.value) || 25)}
-            className="mt-1 w-24 rounded-lg border border-neutral-700 bg-neutral-900 px-3 py-2 outline-none focus:border-neutral-400"
-          />
-        </label>
-        <button
-          onClick={search}
-          disabled={loading}
-          className="rounded-lg bg-white px-5 py-2 font-medium text-black disabled:opacity-50"
-        >
-          {loading ? "Scanning…" : "Scan"}
-        </button>
-        {result && (
+        {!cursor || !items.length ? (
+          <button
+            onClick={() => scan(true)}
+            disabled={scanning}
+            className="rounded-lg bg-white px-5 py-2 font-medium text-black disabled:opacity-50"
+          >
+            {scanning ? "Scanning…" : "Scan"}
+          </button>
+        ) : (
+          <button
+            onClick={() => scan(false)}
+            disabled={scanning}
+            className="rounded-lg bg-white px-5 py-2 font-medium text-black disabled:opacity-50"
+          >
+            {scanning ? "Scanning…" : "Resume"}
+          </button>
+        )}
+        {items.length > 0 && (
           <button
             onClick={downloadAll}
-            disabled={downloading}
+            disabled={downloading || scanning}
             className="rounded-lg bg-emerald-500 px-5 py-2 font-medium text-black disabled:opacity-50"
           >
             {downloading
               ? `Downloading ${progress.done}/${progress.total}…`
-              : `Download ZIP (${result.items.length})`}
+              : `Download ZIP (${items.length})`}
           </button>
         )}
       </div>
+
+      {stats.pages > 0 && (
+        <p className="mt-3 text-sm text-neutral-500">
+          Scanned {stats.tweets} tweets ({stats.pages} pages) → {items.length} media
+          {cursor && " — more available, Resume to continue"}
+        </p>
+      )}
 
       {error && (
         <div className="mt-4 rounded-lg border border-red-800 bg-red-950/50 px-4 py-3 text-sm text-red-300">
@@ -158,23 +206,22 @@ export default function Home() {
         </div>
       )}
 
-      {result && (
+      {user && (
         <div className="mt-8">
           <h2 className="text-xl font-semibold">
-            @{result.user.screenName}{" "}
+            @{user.screenName}{" "}
             <span className="text-sm font-normal text-neutral-400">
               — {photos} photos, {vids} videos
-              {!result.done && " (hit page limit, more may exist)"}
             </span>
           </h2>
           <div className="mt-4 grid grid-cols-3 gap-3 sm:grid-cols-4 md:grid-cols-6">
-            {result.items.map((item) => (
+            {items.map((item) => (
               <a
-                key={item.id + item.url}
+                key={item.url}
                 href={item.postUrl}
                 target="_blank"
                 rel="noreferrer"
-                className="group relative aspect-square overflow-hidden rounded-lg bg-neutral-800"
+                className="relative aspect-square overflow-hidden rounded-lg bg-neutral-800"
                 title={item.postUrl}
               >
                 {item.type === "photo" ? (

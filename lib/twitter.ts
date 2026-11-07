@@ -25,21 +25,30 @@ export interface ScrapeResult {
   user: { name: string; screenName: string; avatar?: string };
   items: MediaItem[];
   pagesFetched: number;
+  tweetsScanned: number;
+  nextCursor: string | null;
   done: boolean;
+  error?: string;
 }
 
-interface GqlResponse {
-  data?: any;
-  errors?: { message?: string }[];
+interface UserInfo {
+  rest_id: string;
+  legacy?: { name?: string; screen_name?: string; profile_image_url_https?: string };
 }
 
+// In-memory cache: username -> resolved user (survives across requests on the
+// same warm serverless instance).
+const userCache = new Map<string, UserInfo>();
 let cachedGuest: { token: string; expires: number } | null = null;
 
-async function getGuestToken(): Promise<string> {
-  const authToken = process.env.AUTH_TOKEN;
-  const ct0 = process.env.CT0;
-  if (authToken && ct0) return "authenticated"; // sentinel; cookies are used instead
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+function usesCookies(): boolean {
+  return Boolean(process.env.AUTH_TOKEN && process.env.CT0);
+}
+
+async function getGuestToken(): Promise<string | null> {
+  if (usesCookies()) return null;
   if (cachedGuest && cachedGuest.expires > Date.now() + 30_000) {
     return cachedGuest.token;
   }
@@ -58,9 +67,11 @@ async function gql(
   operation: string,
   variables: Record<string, unknown>
 ): Promise<any> {
-  const guest = await getGuestToken();
   const authToken = process.env.AUTH_TOKEN;
   const ct0 = process.env.CT0;
+  const url = `${API}/${queryId}/${operation}?variables=${encodeURIComponent(
+    JSON.stringify(variables)
+  )}&features=${encodeURIComponent(JSON.stringify({}))}`;
 
   const headers: Record<string, string> = {
     authorization: BEARER,
@@ -69,43 +80,48 @@ async function gql(
     "x-twitter-client-language": "en",
     accept: "*/*",
   };
-  if (guest !== "authenticated") {
-    headers["x-guest-token"] = guest;
-  }
   if (authToken && ct0) {
     headers.cookie = `auth_token=${authToken}; ct0=${ct0}`;
     headers["x-csrf-token"] = ct0;
   }
 
-  const url = `${API}/${queryId}/${operation}?variables=${encodeURIComponent(
-    JSON.stringify(variables)
-  )}&features=${encodeURIComponent(JSON.stringify({}))}`;
+  // One retry on 429: fresh guest token + short backoff.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const guest = await getGuestToken();
+    const h = { ...headers };
+    if (guest) h["x-guest-token"] = guest;
 
-  const res = await fetch(url, { headers, cache: "no-store" });
-  const text = await res.text();
-  if (!res.ok) {
-    throw new Error(`X API ${res.status} for ${operation}: ${text.slice(0, 200)}`);
+    const res = await fetch(url, { headers: h, cache: "no-store" });
+    if (res.status === 429 && attempt === 0) {
+      cachedGuest = null;
+      await sleep(3000);
+      continue;
+    }
+    const text = await res.text();
+    if (!res.ok) {
+      throw new Error(`X API ${res.status} for ${operation}: ${text.slice(0, 200)}`);
+    }
+    const json = JSON.parse(text) as { data?: any; errors?: { message?: string }[] };
+    if (json.errors?.length) {
+      throw new Error(`X API error for ${operation}: ${json.errors[0]?.message ?? "unknown"}`);
+    }
+    return json.data;
   }
-  const json = JSON.parse(text) as GqlResponse;
-  if (json.errors?.length) {
-    throw new Error(`X API error for ${operation}: ${json.errors[0]?.message ?? "unknown"}`);
-  }
-  return json.data;
+  throw new Error(`X API 429 for ${operation}: Rate limit exceeded`);
 }
 
-interface UserResult {
-  rest_id: string;
-  legacy?: { name?: string; screen_name?: string; profile_image_url_https?: string };
-}
-
-async function resolveUser(screenName: string): Promise<UserResult> {
+async function resolveUser(screenName: string): Promise<UserInfo> {
+  const key = screenName.toLowerCase();
+  const cached = userCache.get(key);
+  if (cached) return cached;
   const data = await gql(Q_USER_BY_SCREEN_NAME, "UserByScreenName", {
     screen_name: screenName,
     withSafetyModeUserFields: true,
   });
   const result = data?.user?.result;
   if (!result?.rest_id) throw new Error(`User "@${screenName}" not found`);
-  return result as UserResult;
+  userCache.set(key, result as UserInfo);
+  return result as UserInfo;
 }
 
 function unwrapTweet(entry: any): any {
@@ -131,9 +147,15 @@ function extOf(url: string, fallback: string): string {
   return e === "jpeg" ? "jpg" : e;
 }
 
+/**
+ * Scrapes up to `maxPages` timeline pages starting at `cursor`.
+ * Never throws mid-loop: on error it returns partial results plus nextCursor
+ * so the caller can resume later.
+ */
 export async function scrapeUserMedia(
   rawUsername: string,
-  maxPages = 25
+  maxPages = 5,
+  cursor?: string
 ): Promise<ScrapeResult> {
   const screenName = rawUsername.replace(/^@/, "").trim();
   if (!screenName) throw new Error("Username is required");
@@ -141,9 +163,10 @@ export async function scrapeUserMedia(
   const user = await resolveUser(screenName);
   const items: MediaItem[] = [];
   const seen = new Set<string>();
-  let cursor: string | undefined;
   let pagesFetched = 0;
+  let tweetsScanned = 0;
   let done = false;
+  let error: string | undefined;
 
   while (pagesFetched < maxPages && !done) {
     const variables: Record<string, unknown> = {
@@ -154,11 +177,19 @@ export async function scrapeUserMedia(
     };
     if (cursor) variables.cursor = cursor;
 
-    const data = await gql(Q_USER_TWEETS, "UserTweets", variables);
+    let data: any;
+    try {
+      data = await gql(Q_USER_TWEETS, "UserTweets", variables);
+    } catch (e) {
+      error = e instanceof Error ? e.message : "Scrape failed";
+      break;
+    }
+
     const instructions =
       data?.user?.result?.timeline?.timeline?.instructions ?? [];
 
     let nextCursor: string | undefined;
+    let tweetsThisPage = 0;
     for (const ins of instructions) {
       for (const entry of ins.entries ?? []) {
         const entryId: string = entry.entryId ?? "";
@@ -168,6 +199,7 @@ export async function scrapeUserMedia(
         }
         const tweet = unwrapTweet(entry);
         if (!tweet?.rest_id) continue;
+        tweetsThisPage++;
         const legacy = tweet.legacy;
         const media =
           legacy.extended_entities?.media ?? legacy.entities?.media ?? [];
@@ -183,10 +215,8 @@ export async function scrapeUserMedia(
           } else {
             url = m.media_url_https ? `${m.media_url_https}?name=orig` : null;
           }
-          if (!url) return;
-          const key = `${url}`;
-          if (seen.has(key)) return;
-          seen.add(key);
+          if (!url || seen.has(url)) return;
+          seen.add(url);
           const filename = `${tweet.rest_id}-${i + 1}.${extOf(url, fallback)}`;
           items.push({
             id: m.media_key ?? `${tweet.rest_id}-${i}`,
@@ -200,6 +230,7 @@ export async function scrapeUserMedia(
     }
 
     pagesFetched++;
+    tweetsScanned += tweetsThisPage;
     cursor = nextCursor;
     if (!cursor) done = true;
   }
@@ -212,6 +243,9 @@ export async function scrapeUserMedia(
     },
     items,
     pagesFetched,
+    tweetsScanned,
+    nextCursor: done ? null : (cursor ?? null),
     done,
+    error,
   };
 }
