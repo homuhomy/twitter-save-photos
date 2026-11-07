@@ -193,14 +193,20 @@ export async function scrapeUserMedia(
     for (const ins of instructions) {
       for (const entry of ins.entries ?? []) {
         const entryId: string = entry.entryId ?? "";
-        if (entryId.startsWith("cursor-bottom-")) {
-          nextCursor = entryId.slice("cursor-bottom-".length);
+        if (
+          entryId.startsWith("cursor-bottom-") ||
+          (entry.content?.__typename === "TimelineTimelineCursor" &&
+            entry.content.cursorType === "Bottom")
+        ) {
+          nextCursor = entry.content?.value ?? nextCursor;
           continue;
         }
         const tweet = unwrapTweet(entry);
         if (!tweet?.rest_id) continue;
         tweetsThisPage++;
         const legacy = tweet.legacy;
+        // Skip retweets — only media owned by this user.
+        if (legacy.retweeted_status_result) continue;
         const media =
           legacy.extended_entities?.media ?? legacy.entities?.media ?? [];
         const postUrl = `https://x.com/${screenName}/status/${tweet.rest_id}`;
